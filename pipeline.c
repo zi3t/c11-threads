@@ -36,6 +36,7 @@ typedef struct {
   message_kind kind;
   size_t id;
   int value;
+  struct timespec created_at;
 } message;
 
 typedef struct {
@@ -61,6 +62,23 @@ static void fail_pthread(int error, const char *operation) {
     fprintf(stderr, "%s failed: %s\n", operation, strerror(error));
     exit(EXIT_FAILURE);
   }
+}
+
+static struct timespec timestamp_now(void) {
+  struct timespec timestamp;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &timestamp) == -1) {
+    fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  return timestamp;
+}
+
+static long long elapsed_microseconds(struct timespec start,
+                                      struct timespec end) {
+  return ((long long)end.tv_sec - (long long)start.tv_sec) * 1000000LL +
+         ((long long)end.tv_nsec - (long long)start.tv_nsec) / 1000LL;
 }
 
 static void queue_init(queue *q) {
@@ -127,6 +145,7 @@ static void *producer_main(void *argument) {
         .kind = MESSAGE_DATA,
         .id = id,
         .value = (int)id,
+        .created_at = timestamp_now(),
     };
     queue_push(context->output, item);
   }
@@ -169,10 +188,13 @@ static void *consumer_main(void *argument) {
     }
 
     const int expected = (int)item.id + sum_of_stage_numbers;
+    const long long latency_us =
+        elapsed_microseconds(item.created_at, timestamp_now());
     /* Queue removal is FIFO, but concurrent consumers need not print in it. */
-    printf("consumer %zu: message %2zu: value=%2d expected=%2d %s\n",
+    printf("consumer %zu: message %2zu: value=%2d expected=%2d latency=%lld us "
+           "%s\n",
            context->consumer_number, item.id, item.value, expected,
-           item.value == expected ? "OK" : "ERROR");
+           latency_us, item.value == expected ? "OK" : "ERROR");
   }
 }
 
