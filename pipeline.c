@@ -9,17 +9,19 @@
 #include <time.h>
 
 /*
- * A small 10-thread pipeline:
+ * A small 11-thread pipeline:
  *
- * producer -> stage 1 -> ... -> stage 8 -> consumer
+ * producer -> stage 1 -> ... -> stage 8 -> consumer 1 / consumer 2
  *
  * Each arrow is a bounded, thread-safe queue. A STOP message travels through
  * the pipeline after the final DATA message so every thread can exit cleanly.
  */
 
 enum {
-  WORKER_COUNT = 10,
-  CHANNEL_COUNT = WORKER_COUNT - 1,
+  STAGE_COUNT = 8,
+  CONSUMER_COUNT = 2,
+  WORKER_COUNT = 1 + STAGE_COUNT + CONSUMER_COUNT,
+  CHANNEL_COUNT = STAGE_COUNT + 1,
   QUEUE_CAPACITY = 4,
   MESSAGE_COUNT = 12,
   SLOW_STAGE_NUMBER = 4,
@@ -49,6 +51,7 @@ typedef struct {
 
 typedef struct {
   size_t stage_number;
+  size_t consumer_number;
   queue *input;
   queue *output;
 } worker_context;
@@ -160,12 +163,16 @@ static void *consumer_main(void *argument) {
     const message item = queue_pop(context->input);
 
     if (item.kind == MESSAGE_STOP) {
+      /* Relay the sentinel so every consumer can stop. */
+      queue_push(context->input, item);
       return NULL;
     }
 
     const int expected = (int)item.id + sum_of_stage_numbers;
-    printf("message %2zu: value=%2d expected=%2d %s\n", item.id, item.value,
-           expected, item.value == expected ? "OK" : "ERROR");
+    /* Queue removal is FIFO, but concurrent consumers need not print in it. */
+    printf("consumer %zu: message %2zu: value=%2d expected=%2d %s\n",
+           context->consumer_number, item.id, item.value, expected,
+           item.value == expected ? "OK" : "ERROR");
   }
 }
 
@@ -184,7 +191,7 @@ int main(void) {
   fail_pthread(pthread_create(&threads[0], NULL, producer_main, &contexts[0]),
                "pthread_create");
 
-  for (size_t index = 1U; index < WORKER_COUNT - 1U; ++index) {
+  for (size_t index = 1U; index <= STAGE_COUNT; ++index) {
     contexts[index] = (worker_context){
         .stage_number = index,
         .input = &channels[index - 1U],
@@ -195,12 +202,16 @@ int main(void) {
         "pthread_create");
   }
 
-  contexts[WORKER_COUNT - 1U] = (worker_context){
-      .input = &channels[CHANNEL_COUNT - 1U],
-  };
-  fail_pthread(pthread_create(&threads[WORKER_COUNT - 1U], NULL, consumer_main,
-                              &contexts[WORKER_COUNT - 1U]),
-               "pthread_create");
+  for (size_t index = 0U; index < CONSUMER_COUNT; ++index) {
+    const size_t thread_index = 1U + STAGE_COUNT + index;
+    contexts[thread_index] = (worker_context){
+        .consumer_number = index + 1U,
+        .input = &channels[CHANNEL_COUNT - 1U],
+    };
+    fail_pthread(pthread_create(&threads[thread_index], NULL, consumer_main,
+                                &contexts[thread_index]),
+                 "pthread_create");
+  }
 
   for (size_t index = 0U; index < WORKER_COUNT; ++index) {
     fail_pthread(pthread_join(threads[index], NULL), "pthread_join");
