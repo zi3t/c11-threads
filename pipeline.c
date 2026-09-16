@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <stdbool.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -44,7 +45,7 @@ typedef struct {
   size_t read_at;
   size_t write_at;
   size_t count;
-  size_t full_waits;
+  size_t dropped_messages;
   pthread_mutex_t mutex;
   pthread_cond_t not_empty;
   pthread_cond_t not_full;
@@ -94,11 +95,28 @@ static void queue_destroy(queue *q) {
   fail_pthread(pthread_mutex_destroy(&q->mutex), "pthread_mutex_destroy");
 }
 
-static void queue_push(queue *q, message item) {
+static bool queue_try_push(queue *q, message item) {
+  fail_pthread(pthread_mutex_lock(&q->mutex), "pthread_mutex_lock");
+
+  if (q->count == QUEUE_CAPACITY) {
+    ++q->dropped_messages;
+    fail_pthread(pthread_mutex_unlock(&q->mutex), "pthread_mutex_unlock");
+    return false;
+  }
+
+  q->items[q->write_at] = item;
+  q->write_at = (q->write_at + 1U) % QUEUE_CAPACITY;
+  ++q->count;
+
+  fail_pthread(pthread_cond_signal(&q->not_empty), "pthread_cond_signal");
+  fail_pthread(pthread_mutex_unlock(&q->mutex), "pthread_mutex_unlock");
+  return true;
+}
+
+static void queue_push_stop(queue *q, message item) {
   fail_pthread(pthread_mutex_lock(&q->mutex), "pthread_mutex_lock");
 
   while (q->count == QUEUE_CAPACITY) {
-    ++q->full_waits;
     fail_pthread(pthread_cond_wait(&q->not_full, &q->mutex),
                  "pthread_cond_wait");
   }
@@ -147,10 +165,10 @@ static void *producer_main(void *argument) {
         .value = (int)id,
         .created_at = timestamp_now(),
     };
-    queue_push(context->output, item);
+    (void)queue_try_push(context->output, item);
   }
 
-  queue_push(context->output, (message){.kind = MESSAGE_STOP});
+  queue_push_stop(context->output, (message){.kind = MESSAGE_STOP});
   return NULL;
 }
 
@@ -161,7 +179,7 @@ static void *stage_main(void *argument) {
     message item = queue_pop(context->input);
 
     if (item.kind == MESSAGE_STOP) {
-      queue_push(context->output, item);
+      queue_push_stop(context->output, item);
       return NULL;
     }
 
@@ -170,7 +188,7 @@ static void *stage_main(void *argument) {
     if (context->stage_number == SLOW_STAGE_NUMBER) {
       slow_stage();
     }
-    queue_push(context->output, item);
+    (void)queue_try_push(context->output, item);
   }
 }
 
@@ -183,7 +201,7 @@ static void *consumer_main(void *argument) {
 
     if (item.kind == MESSAGE_STOP) {
       /* Relay the sentinel so every consumer can stop. */
-      queue_push(context->input, item);
+      queue_push_stop(context->input, item);
       return NULL;
     }
 
@@ -240,9 +258,9 @@ int main(void) {
   }
 
   for (size_t index = 0U; index < CHANNEL_COUNT; ++index) {
-    if (channels[index].full_waits != 0U) {
-      printf("backpressure: channel %zu was full %zu time(s)\n", index + 1U,
-             channels[index].full_waits);
+    if (channels[index].dropped_messages != 0U) {
+      printf("dropped: channel %zu rejected %zu message(s)\n", index + 1U,
+             channels[index].dropped_messages);
     }
   }
 
