@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * A small 10-thread pipeline:
@@ -20,6 +22,7 @@ enum {
   CHANNEL_COUNT = WORKER_COUNT - 1,
   QUEUE_CAPACITY = 4,
   MESSAGE_COUNT = 12,
+  SLOW_STAGE_NUMBER = 4,
 };
 
 typedef enum {
@@ -38,6 +41,7 @@ typedef struct {
   size_t read_at;
   size_t write_at;
   size_t count;
+  size_t full_waits;
   pthread_mutex_t mutex;
   pthread_cond_t not_empty;
   pthread_cond_t not_full;
@@ -73,7 +77,9 @@ static void queue_push(queue *q, message item) {
   fail_pthread(pthread_mutex_lock(&q->mutex), "pthread_mutex_lock");
 
   while (q->count == QUEUE_CAPACITY) {
-    fail_pthread(pthread_cond_wait(&q->not_full, &q->mutex), "pthread_cond_wait");
+    ++q->full_waits;
+    fail_pthread(pthread_cond_wait(&q->not_full, &q->mutex),
+                 "pthread_cond_wait");
   }
 
   q->items[q->write_at] = item;
@@ -84,11 +90,21 @@ static void queue_push(queue *q, message item) {
   fail_pthread(pthread_mutex_unlock(&q->mutex), "pthread_mutex_unlock");
 }
 
+static void slow_stage(void) {
+  const struct timespec delay = {
+      .tv_nsec = 10 * 1000 * 1000,
+  };
+
+  while (nanosleep(&delay, NULL) == -1 && errno == EINTR) {
+  }
+}
+
 static message queue_pop(queue *q) {
   fail_pthread(pthread_mutex_lock(&q->mutex), "pthread_mutex_lock");
 
   while (q->count == 0U) {
-    fail_pthread(pthread_cond_wait(&q->not_empty, &q->mutex), "pthread_cond_wait");
+    fail_pthread(pthread_cond_wait(&q->not_empty, &q->mutex),
+                 "pthread_cond_wait");
   }
 
   const message item = q->items[q->read_at];
@@ -129,6 +145,9 @@ static void *stage_main(void *argument) {
 
     /* Each stage makes one visible, deterministic change. */
     item.value += (int)context->stage_number;
+    if (context->stage_number == SLOW_STAGE_NUMBER) {
+      slow_stage();
+    }
     queue_push(context->output, item);
   }
 }
@@ -145,8 +164,8 @@ static void *consumer_main(void *argument) {
     }
 
     const int expected = (int)item.id + sum_of_stage_numbers;
-    printf("message %2zu: value=%2d expected=%2d %s\n", item.id, item.value, expected,
-           item.value == expected ? "OK" : "ERROR");
+    printf("message %2zu: value=%2d expected=%2d %s\n", item.id, item.value,
+           expected, item.value == expected ? "OK" : "ERROR");
   }
 }
 
@@ -162,7 +181,8 @@ int main(void) {
   contexts[0] = (worker_context){
       .output = &channels[0],
   };
-  fail_pthread(pthread_create(&threads[0], NULL, producer_main, &contexts[0]), "pthread_create");
+  fail_pthread(pthread_create(&threads[0], NULL, producer_main, &contexts[0]),
+               "pthread_create");
 
   for (size_t index = 1U; index < WORKER_COUNT - 1U; ++index) {
     contexts[index] = (worker_context){
@@ -170,8 +190,9 @@ int main(void) {
         .input = &channels[index - 1U],
         .output = &channels[index],
     };
-    fail_pthread(pthread_create(&threads[index], NULL, stage_main, &contexts[index]),
-                 "pthread_create");
+    fail_pthread(
+        pthread_create(&threads[index], NULL, stage_main, &contexts[index]),
+        "pthread_create");
   }
 
   contexts[WORKER_COUNT - 1U] = (worker_context){
@@ -183,6 +204,13 @@ int main(void) {
 
   for (size_t index = 0U; index < WORKER_COUNT; ++index) {
     fail_pthread(pthread_join(threads[index], NULL), "pthread_join");
+  }
+
+  for (size_t index = 0U; index < CHANNEL_COUNT; ++index) {
+    if (channels[index].full_waits != 0U) {
+      printf("backpressure: channel %zu was full %zu time(s)\n", index + 1U,
+             channels[index].full_waits);
+    }
   }
 
   for (size_t index = 0U; index < CHANNEL_COUNT; ++index) {

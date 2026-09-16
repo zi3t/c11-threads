@@ -49,10 +49,21 @@ Each adjacent pair of threads shares one `queue`. A producer waits when its outp
 
 Every processing stage adds its stage number to the message value. After the final data message, the producer sends `MESSAGE_STOP`. Each stage forwards that sentinel before exiting, allowing the consumer and then `main` to finish without cancellation or detached threads.
 
+## Backpressure demonstration
+
+The example uses a capacity of 4 and pauses stage 4 for 10 ms after it
+processes each data message. This lets the queue before that stage fill, which
+eventually makes upstream stages wait. At shutdown, the program reports every
+channel that had one or more full-queue waits, for example:
+
+```text
+backpressure: channel 3 was full 8 time(s)
+```
+
 ## Exercises
 
 1. Change `QUEUE_CAPACITY` to `1` and `32`.
-2. Add a short `nanosleep` to one stage and observe backpressure.
+2. Move the `nanosleep` to another stage and compare the reported full queues.
 3. Add a second consumer and consider whether output order remains deterministic.
 4. Add timestamps to `message` and calculate end-to-end latency.
 5. Replace the blocking `queue_push` with a non-blocking `queue_try_push` and count dropped messages.
